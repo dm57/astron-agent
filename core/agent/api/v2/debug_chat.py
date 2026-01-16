@@ -1,10 +1,12 @@
 import json
+import time
 from typing import Annotated, Any, AsyncGenerator, cast, List
 
 from common.otlp.trace.span import Span
 from common.service import get_db_service
 from common.service.db.db_service import session_getter
 from fastapi import APIRouter, Header
+from fastapi.responses import JSONResponse
 from pydantic import ConfigDict
 from starlette.responses import StreamingResponse
 
@@ -184,14 +186,84 @@ async def bot_debug_chat(
                 question=inputs.get_last_message_content(),
             )
 
-            async def generate() -> AsyncGenerator[str, None]:
-                """Generator for streaming response."""
-                async for response in completion.do_complete():
-                    # Convert chunk to JSON string for streaming response
-                    yield response
+            if inputs.stream:
+                async def generate() -> AsyncGenerator[str, None]:
+                    """Generator for streaming response."""
+                    async for response in completion.do_complete():
+                        yield response
 
-            return StreamingResponse(
-                generate(),
-                media_type="text/event-stream",
-                headers=headers,
-            )
+                return StreamingResponse(
+                    generate(),
+                    media_type="text/event-stream",
+                    headers=headers,
+                )
+
+            aggregated_content: str = ""
+            aggregated_reasoning: str = ""
+            aggregated_tool_calls: List[Any] = []
+            aggregated_tool_call_responses: List[Any] = []
+            usage: Any = None
+            code: int = 0
+            message: str = "success"
+            resp_id: str = ""
+            model: str = ""
+            created: int = 0
+
+            async for response in completion.do_complete():
+                if not response.startswith("data:"):
+                    continue
+                payload_str = response[len("data:"):].strip()
+                if payload_str == "[DONE]":
+                    continue
+                try:
+                    payload = json.loads(payload_str)
+                except json.JSONDecodeError:
+                    continue
+
+                if payload.get("object") != "chat.completion.chunk":
+                    continue
+
+                code = payload.get("code", code)
+                message = payload.get("message", message)
+                resp_id = payload.get("id", resp_id)
+                model = payload.get("model", model)
+                created = payload.get("created", created)
+
+                choices = payload.get("choices") or []
+                delta = choices[0].get("delta", {}) if choices else {}
+                aggregated_content += delta.get("content", "") or ""
+                aggregated_reasoning += delta.get("reasoning_content", "") or ""
+                aggregated_tool_calls.extend(delta.get("tool_calls") or [])
+                aggregated_tool_call_responses.extend(
+                    delta.get("tool_call_responses") or []
+                )
+
+                if "usage" in payload:
+                    usage = payload.get("usage")
+
+            aggregated_payload = {
+                "code": code,
+                "message": message,
+                "id": resp_id,
+                "created": created or int(time.time() * 1000),
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "delta": {
+                            "role": "assistant",
+                            "content": aggregated_content,
+                            "reasoning_content": aggregated_reasoning,
+                            "tool_calls": aggregated_tool_calls,
+                            "tool_call_responses": aggregated_tool_call_responses,
+                        },
+                    }
+                ],
+                "object": "chat.completion.chunk",
+                "model": model,
+            }
+
+            if usage is not None:
+                aggregated_payload["usage"] = usage
+
+            return JSONResponse(content=aggregated_payload, headers=headers)

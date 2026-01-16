@@ -1,3 +1,4 @@
+import time
 from typing import List, Literal, Optional, Any
 
 from openai.types.chat.chat_completion_chunk import (
@@ -9,6 +10,8 @@ from openai.types.chat.chat_completion_chunk import (
 )
 from pydantic import Field, BaseModel
 
+def cur_timestamp() -> int:
+    return int(time.time() * 1000)
 
 class BotDebugChatChoiceDeltaToolCallFunction(ChoiceDeltaToolCallFunction):
     arguments: dict
@@ -16,7 +19,8 @@ class BotDebugChatChoiceDeltaToolCallFunction(ChoiceDeltaToolCallFunction):
 
 class BotDebugChatChoiceDeltaToolCall(ChoiceDeltaToolCall):
     function: Optional[BotDebugChatChoiceDeltaToolCallFunction] = None
-    type: Optional[Literal["workflow", "link", "knowledge"]] = None  # type: ignore[assignment]
+    type: Optional[Literal["workflow", "link", "knowledge", "mcp"]] = None  # type: ignore[assignment]
+    reason: str = Field(default="")
 
 
 class BotDebugChatChoiceDeltaToolCallResponseResponse(BaseModel):
@@ -49,6 +53,8 @@ class BotDebugChatChoice(Choice):
 class BotDebugChatCompletionChunk(ChatCompletionChunk):
     code: int = Field(default=0)
     message: str = Field(default="success")
+    id: str = Field(default="")
+    created: int = Field(default_factory=cur_timestamp)
     choices: List[BotDebugChatChoice] = Field(default_factory=list)
     object: Literal["chat.completion.chunk"] = Field(default="chat.completion.chunk")
     model: str = Field(default="")

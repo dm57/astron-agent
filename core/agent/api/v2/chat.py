@@ -1,10 +1,13 @@
 import json
-from typing import Annotated, Any, AsyncGenerator, cast
+import time
+from typing import Annotated, Any, AsyncGenerator, cast, List
 
+from agent.api.schemas_v2.bot_debug_chat_response import BotDebugChatCompletionChunk
 from common.otlp.trace.span import Span
 from common.service import get_db_service
 from common.service.db.db_service import session_getter
 from fastapi import APIRouter, Header
+from fastapi.responses import JSONResponse
 from pydantic import ConfigDict
 from starlette.responses import StreamingResponse
 
@@ -16,6 +19,13 @@ from agent.exceptions.agent_exc import AgentInternalExc
 from agent.infra.app_auth import APPAuth
 from agent.service.builder.chat_builder import ChatRunnerBuilder
 from agent.service.runner.debug_chat_runner import DebugChatRunner
+
+from common.otlp.log_trace.node_trace_log import NodeTraceLog as NodeTrace
+from common.otlp.metrics.meter import Meter
+from common.exceptions.base import BaseExc
+from agent.exceptions.agent_exc import AgentInternalExc, AgentNormalExc
+from agent.api.base import RunContext
+import traceback
 
 chat_router = APIRouter()
 
@@ -65,6 +75,52 @@ class CustomChatCompletion(CompletionBase):
             # Use parent class run_runner method which includes _finalize_run logic
             async for response in self.run_runner(node_trace, meter, span=sp):
                 yield response
+
+    async def run_runner(
+            self, node_trace: NodeTrace, meter: Meter, span: Span
+    ) -> AsyncGenerator[str, None]:
+        with span.start("RunRunner") as sp:
+            error: BaseExc = AgentNormalExc()
+            error_log: str = ""
+            chunk_logs: List[str] = []
+
+            try:
+                runner = await self.build_runner(sp)
+                if runner is None:
+                    raise AgentInternalExc("Failed to build runner")
+
+                async for chunk in runner.run(span=sp, node_trace=node_trace):
+                    chunk.id = span.sid
+                    async for processed_chunk in self.create_sse_chunk(
+                            chunk, chunk_logs
+                    ):
+                        yield processed_chunk
+
+            except BaseExc as e:
+                error = e
+                error_log = traceback.format_exc()
+            except Exception as e:
+                error = AgentInternalExc(str(e))
+                error_log = traceback.format_exc()
+            finally:
+                context = RunContext(
+                    error=error,
+                    error_log=error_log,
+                    chunk_logs=chunk_logs,
+                    span=sp,
+                    node_trace=node_trace,
+                    meter=meter,
+                )
+                async for final_chunk in self._finalize_run(context):
+                    yield final_chunk
+
+    async def create_sse_chunk(
+        self, chunk: BotDebugChatCompletionChunk, chunk_logs: List[str]
+    ) -> AsyncGenerator[str, None]:
+        frame_data = chunk.model_dump_json()
+        frame = f"data: {frame_data}\n\n"
+        chunk_logs.append(frame_data)
+        yield frame
 
 
 async def _validate_app_auth(app_id: str, sp: Span) -> None:
@@ -132,14 +188,84 @@ async def bot_chat(
                 dsl=BotDsl(**json.loads(bot_release.dsl)),
             )
 
-            async def generate() -> AsyncGenerator[str, None]:
-                """Generator for streaming response."""
-                async for response in completion.do_complete():
-                    # Convert chunk to JSON string for streaming response
-                    yield response
+            if inputs.stream:
+                async def generate() -> AsyncGenerator[str, None]:
+                    """Generator for streaming response."""
+                    async for response in completion.do_complete():
+                        yield response
 
-            return StreamingResponse(
-                generate(),
-                media_type="text/event-stream",
-                headers=headers,
-            )
+                return StreamingResponse(
+                    generate(),
+                    media_type="text/event-stream",
+                    headers=headers,
+                )
+
+            aggregated_content: str = ""
+            aggregated_reasoning: str = ""
+            aggregated_tool_calls: List[Any] = []
+            aggregated_tool_call_responses: List[Any] = []
+            usage: Any = None
+            code: int = 0
+            message: str = "success"
+            resp_id: str = ""
+            model: str = ""
+            created: int = 0
+
+            async for response in completion.do_complete():
+                if not response.startswith("data:"):
+                    continue
+                payload_str = response[len("data:"):].strip()
+                if payload_str == "[DONE]":
+                    continue
+                try:
+                    payload = json.loads(payload_str)
+                except json.JSONDecodeError:
+                    continue
+
+                if payload.get("object") != "chat.completion.chunk":
+                    continue
+
+                code = payload.get("code", code)
+                message = payload.get("message", message)
+                resp_id = payload.get("id", resp_id)
+                model = payload.get("model", model)
+                created = payload.get("created", created)
+
+                choices = payload.get("choices") or []
+                delta = choices[0].get("delta", {}) if choices else {}
+                aggregated_content += delta.get("content", "") or ""
+                aggregated_reasoning += delta.get("reasoning_content", "") or ""
+                aggregated_tool_calls.extend(delta.get("tool_calls") or [])
+                aggregated_tool_call_responses.extend(
+                    delta.get("tool_call_responses") or []
+                )
+
+                if "usage" in payload:
+                    usage = payload.get("usage")
+
+            aggregated_payload = {
+                "code": code,
+                "message": message,
+                "id": resp_id,
+                "created": created or int(time.time() * 1000),
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "delta": {
+                            "role": "assistant",
+                            "content": aggregated_content,
+                            "reasoning_content": aggregated_reasoning,
+                            "tool_calls": aggregated_tool_calls,
+                            "tool_call_responses": aggregated_tool_call_responses,
+                        },
+                    }
+                ],
+                "object": "chat.completion.chunk",
+                "model": model,
+            }
+
+            if usage is not None:
+                aggregated_payload["usage"] = usage
+
+            return JSONResponse(content=aggregated_payload, headers=headers)

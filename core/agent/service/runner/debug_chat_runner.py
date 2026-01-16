@@ -1,5 +1,5 @@
 import json
-from typing import Any, AsyncGenerator, Sequence
+from typing import Any, AsyncGenerator
 
 # Use unified common package import module
 from common.otlp.log_trace.node_log import Data as NodeData
@@ -8,11 +8,9 @@ from common.otlp.log_trace.node_trace_log import NodeTraceLog as NodeTrace
 from common.otlp.trace.span import Span
 from pydantic import BaseModel, ConfigDict, Field
 
-from agent.api.schemas.agent_response import AgentResponse, CotStep
+from agent.api.schemas.agent_response import AgentResponse
 from agent.api.schemas.completion_chunk import (
     ReasonChatCompletionChunk,
-    ReasonChoice,
-    ReasonChoiceDelta,
     ReasonChoiceDeltaToolCall,
     ReasonChoiceDeltaToolCallFunction,
 )
@@ -23,6 +21,8 @@ from agent.api.schemas_v2.bot_debug_chat_response import (
     BotDebugChatChoiceDelta,
     BotDebugChatChoiceDeltaToolCall,
     BotDebugChatChoiceDeltaToolCallFunction,
+    BotDebugChatChoiceDeltaToolCallResponse,
+    BotDebugChatChoiceDeltaToolCallResponseResponse,
 )
 
 
@@ -51,7 +51,7 @@ class DebugChatRunner(BaseModel):
         """Convert BotAgentResponse to return frame"""
 
         chunk = BotDebugChatCompletionChunk(
-            id="",
+            id=str(span.sid),
             choices=[BotDebugChatChoice(index=0, delta=BotDebugChatChoiceDelta())],
             created=message.created,
             usage=message.usage,
@@ -59,17 +59,13 @@ class DebugChatRunner(BaseModel):
 
         if message.typ == "tool_call":
             await self._handle_tool_call(chunk, message, span, node_trace)
+        elif message.typ == "tool_call_result":
+            self._handle_tool_call_result(chunk, message)
 
         if message.typ == "reasoning_content":
             self._handle_reasoning_content(chunk, message)
         elif message.typ == "content":
             self._handle_content(chunk, message)
-        elif message.typ == "cot_step":
-            self._handle_cot_step(chunk, message, span, node_trace)
-        elif message.typ == "log":
-            self._handle_log(chunk, message)
-        elif message.typ == "knowledge_metadata":
-            self._handle_knowledge_metadata(chunk, message)
 
         return chunk
 
@@ -201,4 +197,32 @@ class DebugChatRunner(BaseModel):
                     ),
                 ),
             )
+        ]
+
+    def _handle_tool_call_result(
+        self, chunk: BotDebugChatCompletionChunk, message: BotAgentResponse
+    ) -> None:
+        """Handle tool call execution results."""
+        results = message.content or []
+        if not isinstance(results, list):
+            results = [results]
+
+        chunk.choices[0].delta.tool_call_responses = [
+            BotDebugChatChoiceDeltaToolCallResponse(
+                id=str(r.get("id", "")) if isinstance(r, dict) else "",
+                response_type=str(r.get("plugin_type", r.get("response_type", "")))
+                if isinstance(r, dict)
+                else "",
+                stream=False,
+                chunks=[],
+                response=BotDebugChatChoiceDeltaToolCallResponseResponse(
+                    content_type="json",
+                    content=(
+                        r.get("response", r)
+                        if isinstance(r, dict)
+                        else r
+                    ),
+                ),
+            )
+            for r in results
         ]

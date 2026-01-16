@@ -67,9 +67,9 @@ async def chunk_query(
             raise KnowledgeQueryExc from e
 
 
-async def process_chunk_query_result(
+def process_chunk_query_result(
     resp: Dict[str, Any], repo_type: str
-) -> Dict[str, Any]:
+) -> List[Dict[str, Any]]:
     metadata_list = []
     for result in resp.get("data", {}).get("results", []):
         score = result.get("score", 0)

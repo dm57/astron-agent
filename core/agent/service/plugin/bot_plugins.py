@@ -24,7 +24,7 @@ class BotLinkRunner(LinkPluginRunner):
     async def run(self, action_input: dict[str, Any], span: Span) -> PluginResponse:
         tool_input = copy.deepcopy(action_input)
         for k, v in self.map_keys.items():
-            if v in tool_input:
+            if v in tool_input and k != v:
                 tool_input[k] = tool_input[v]
                 del tool_input[v]
         result = await super().run(tool_input, span)
@@ -37,7 +37,7 @@ class BotMcpRunner(McpPluginRunner):
     async def run(self, action_input: dict[str, Any], span: Span) -> PluginResponse:
         tool_input = copy.deepcopy(action_input)
         for k, v in self.map_keys.items():
-            if v in tool_input:
+            if v in tool_input and k != v:
                 tool_input[k] = tool_input[v]
                 del tool_input[v]
         result = await super().run(tool_input, span)
@@ -50,11 +50,45 @@ class BotWorkflowRunner(WorkflowPluginRunner):
     async def run(self, action_input: dict[str, Any], span: Span) -> PluginResponse:
         tool_input = copy.deepcopy(action_input)
         for k, v in self.map_keys.items():
-            if v in tool_input:
+            if v in tool_input and k != v:
                 tool_input[k] = tool_input[v]
                 del tool_input[v]
-        result = await super().run(tool_input, span)
-        return result
+
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        last_resp: PluginResponse | None = None
+
+        async for resp in super().run(tool_input, span):
+            last_resp = resp
+            if isinstance(resp.result, dict):
+                c = resp.result.get("content")
+                r = resp.result.get("reasoning_content")
+                if isinstance(c, str) and c:
+                    content_parts.append(c)
+                if isinstance(r, str) and r:
+                    reasoning_parts.append(r)
+
+        if last_resp is None:
+            return PluginResponse(
+                code=0,
+                sid="",
+                start_time=0,
+                end_time=0,
+                result={"content": "", "reasoning_content": ""},
+                log=[],
+            )
+
+        if content_parts or reasoning_parts:
+            return last_resp.model_copy(
+                update={
+                    "result": {
+                        "content": "".join(content_parts),
+                        "reasoning_content": "".join(reasoning_parts),
+                    }
+                }
+            )
+
+        return last_resp
 
 
 class BotPluginFactory(BaseModel):
@@ -129,7 +163,12 @@ class BotPluginFactory(BaseModel):
     async def gen_mcp_tools(self, span: Span) -> list[McpPlugin]:
         with span.start("GenMcpTools") as sp:
             tools = []
-            for server in self.dsl.plugin.link_mcp_servers:
+            McpServer = Union[LinkMcpServerInputs, CusMcpServerInputs]
+            servers: list[McpServer] = [
+                *self.dsl.plugin.link_mcp_servers,
+                *self.dsl.plugin.cus_mcp_servers
+            ]
+            for server in servers:
                 for tool in server.tools:
                     server_id = ""
                     server_url = ""
@@ -167,8 +206,8 @@ class BotPluginFactory(BaseModel):
                         ),
                         typ="mcp",
                         run=BotMcpRunner(
-                            server_id=server.server_id,
-                            server_url="",
+                            server_id=server_id,
+                            server_url=server_url,
                             sid=span.sid,
                             name=tool.operation_id,
                             map_keys={
@@ -216,13 +255,12 @@ class BotPluginFactory(BaseModel):
                         app_id=self.app_id,
                         uid=self.uid,
                         flow_id=workflow.flow_id,
-                        version=workflow.version,
+                        map_keys={
+                            k: v.name
+                            for k, v in workflow.fc_schema.parameters.properties.items()
+                        }
                     ).run,
-                    map_keys={
-                        k: v.name
-                        for k, v in workflow.fc_schema.parameters.properties.items()
-                    },
-                ).run,
+                )
                 tools.append(workflow_plugin)
             return tools
 
@@ -257,8 +295,8 @@ class BotPluginFactory(BaseModel):
                         doc_ids=knowledge.properties.docs,
                         score_threshold=knowledge.properties.min_score,
                         rag_type=knowledge.type,
-                    ),
-                ).run,
+                    ).run,
+                )
                 tools.append(knowledge_plugin)
             return tools
 

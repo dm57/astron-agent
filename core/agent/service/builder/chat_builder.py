@@ -3,6 +3,7 @@ import json
 from dataclasses import dataclass
 from typing import Any, cast
 
+from agent.engine.bot.runner import BotRunner
 from common.otlp.trace.span import Span
 
 from agent.api.schemas_v2.bot_chat_inputs import Chat
@@ -14,6 +15,7 @@ from agent.service.builder.base_builder import (
 )
 from agent.service.plugin.knowledge import KnowledgePluginFactory
 from agent.service.runner.debug_chat_runner import DebugChatRunner
+from agent.service.plugin.bot_plugins import BotPluginFactory
 
 
 @dataclass
@@ -38,69 +40,22 @@ class ChatRunnerBuilder(BaseApiBuilder):
                 app_id=self.app_id,
                 model_name=self.dsl.model.properties.id,
                 base_url=self.dsl.model.properties.url,
-                api_key=self.dsl.model.properties.token,
+                api_key=self.dsl.model.properties.bearer_token,
             )
 
-            plugins = await self.build_plugins(
-                tool_ids=(
-                    [i.id for i in self.dsl.plugin.link_tools]
-                    if self.dsl.plugin.link_tools
-                    else []
-                ),
-                mcp_server_ids=(
-                    [i.server_id for i in self.dsl.plugin.link_mcp_servers]
-                    if self.dsl.plugin.link_mcp_servers
-                    else []
-                ),
-                mcp_server_urls=(
-                    [i.server_url for i in self.dsl.plugin.cus_mcp_servers]
-                    if self.dsl.plugin.cus_mcp_servers
-                    else []
-                ),
-                workflow_ids=(
-                    [i.flow_id for i in self.dsl.plugin.workflows]
-                    if self.dsl.plugin.workflows
-                    else []
-                ),
-            )
-            metadata_list, knowledge = (
-                await self.query_knowledge_by_workflow(self.dsl.rag.knowledges, sp)
-                if self.dsl.rag.knowledges
-                else []
-            ), ""
-
-            chat_params = RunnerParams(
-                model=model,
-                chat_history=self.inputs.get_chat_history(),
-                instruct="",
-                knowledge=knowledge,
-                question=self.inputs.get_last_message_content(),
-            )
-            chat_runner = await self.build_chat_runner(chat_params)
-            process_params = RunnerParams(
-                model=model,
-                chat_history=self.inputs.get_chat_history(),
-                instruct="",
-                knowledge=knowledge,
-                question=self.inputs.get_last_message_content(),
-            )
-            process_runner = await self.build_process_runner(process_params)
-            cot_params = CotRunnerParams(
-                model=model,
-                plugins=plugins,
-                chat_history=self.inputs.get_chat_history(),
-                instruct="",
-                knowledge=knowledge,
-                question=self.inputs.get_last_message_content(),
-                process_runner=process_runner,
-            )
-            cot_runner = await self.build_cot_runner(cot_params)
+            plugins = await BotPluginFactory(
+                app_id=self.app_id,
+                uid=self.uid,
+                dsl=self.dsl).gen_tools(sp)
 
             return DebugChatRunner(
-                chat_runner=chat_runner,
-                cot_runner=cot_runner,
-                plugins=plugins,
-                knowledge_metadata_list=metadata_list,
+                bot_runner=BotRunner(
+                    model=model,
+                    chat_history=self.inputs.get_chat_history(),
+                    plugins=plugins,
+                    instruct=self.dsl.prompt.instruct,
+                    question=self.inputs.get_last_message_content()
+                )
             )
 
     async def query_knowledge_by_workflow(

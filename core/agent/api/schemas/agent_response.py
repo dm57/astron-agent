@@ -38,3 +38,4 @@ class BotAgentResponse(BaseModel):
     content: Any
     usage: Optional[CompletionUsage] = Field(default=None)
     created: int = Field(default_factory=cur_timestamp)
+    model: str = Field(default="")
